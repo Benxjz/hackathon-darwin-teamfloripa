@@ -26,27 +26,35 @@ export type EvaluationOutput = {
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
 
 /**
- * 🔹 Função principal: evaluateResponse
- * Recebe uma resposta do assistente e devolve as métricas calculadas.
+ * 🔹 Função principal: evaluateResponse (versão ajustada)
+ * Agora com piso (eps) para evitar notas 0 e 1 absolutas e suavizar as métricas.
  */
 export async function evaluateResponse(input: EvaluationInput): Promise<EvaluationOutput> {
   const { promptConfig, responseText, expectedContext = "", kbSnippets = [] } = input;
 
-  // --- 1️⃣ Prompt Fidelity: similaridade entre prompt e resposta
+  // Pequeno "piso" para suavizar extremos e tornar as notas mais estáveis
+  const eps = 0.05;
+
+  // --- 1️⃣ Prompt Fidelity: similaridade entre prompt/contexto e resposta
   const simWithPrompt = jaccard(promptConfig, responseText);
   const simWithExpected = jaccard(expectedContext || promptConfig, responseText);
-  const promptFidelity = clamp01(simWithExpected || simWithPrompt);
+  const sim = Math.max(simWithPrompt, simWithExpected);
+  const promptFidelity = clamp01(eps + (1 - eps) * sim);
 
-  // --- 2️⃣ Clarity Index: texto claro, tamanho adequado, pouca repetição
+  // --- 2️⃣ Clarity Index: clareza e completude da resposta
   const clarityIndex = clamp01(clarityHeuristic(responseText));
 
-  // --- 3️⃣ Deviation Rate: quanto a resposta foge do contexto
-  const deviationRate = clamp01(1 - simWithExpected);
+  // --- 3️⃣ Deviation Rate: quanto a resposta foge do contexto esperado
+  // (suavizado para não estourar em 1.0 quando a similaridade é baixa)
+  const deviationRate = clamp01(1 - sim * (1 - eps));
 
-  // --- 4️⃣ Grounding Accuracy: se a resposta usa bem a base de conhecimento
-  const groundingAccuracy = clamp01(
-    kbSnippets.length ? Math.max(...kbSnippets.map(s => jaccard(s, responseText))) : 0
-  );
+  // --- 4️⃣ Grounding Accuracy: alinhamento à base de conhecimento (KB)
+  const kbScore = kbSnippets.length
+    ? Math.max(...kbSnippets.map(s => jaccard(s, responseText)))
+    : 0;
+  const groundingAccuracy = kbSnippets.length
+    ? clamp01(eps + (1 - eps) * kbScore)
+    : 0;
 
   return { promptFidelity, clarityIndex, deviationRate, groundingAccuracy };
 }
@@ -55,7 +63,7 @@ export async function evaluateResponse(input: EvaluationInput): Promise<Evaluati
 // 🔧 Funções auxiliares (versão simples, sem IA ainda)
 // ----------------------------------------------------------
 
-// Divide o texto em palavras
+// Divide o texto em palavras normalizadas (minúsculas, sem pontuação)
 function tokenize(s: string) {
   return (s || "")
     .toLowerCase()
@@ -64,7 +72,7 @@ function tokenize(s: string) {
     .filter(Boolean);
 }
 
-// Mede a semelhança entre dois textos (Jaccard)
+// Mede a semelhança entre dois textos (Coeficiente de Jaccard)
 function jaccard(a: string, b: string) {
   const A = new Set(tokenize(a));
   const B = new Set(tokenize(b));
@@ -74,14 +82,13 @@ function jaccard(a: string, b: string) {
   return uni === 0 ? 0 : inter / uni;
 }
 
-// Mede a clareza: penaliza repetições, textos curtos e cheios de interrogações
+// Heurística de clareza: penaliza repetições, textos muito curtos/longos e excesso de '?'
 function clarityHeuristic(text: string) {
   const len = text.length;
   if (len === 0) return 0;
   const qMarks = (text.match(/\?/g) || []).length;
   const repeats = repeatedTokenRatio(text);
 
-  // pontuação simples
   const lenScore = len < 40 ? 0.2 : len > 2000 ? 0.4 : 0.8;
   const qScore = Math.max(0, 1 - qMarks / 10);
   const repScore = Math.max(0, 1 - repeats);
@@ -89,7 +96,7 @@ function clarityHeuristic(text: string) {
   return (lenScore * 0.5 + qScore * 0.25 + repScore * 0.25);
 }
 
-// Detecta palavras repetidas demais
+// Detecta excesso de repetição de tokens
 function repeatedTokenRatio(text: string) {
   const toks = tokenize(text);
   if (toks.length === 0) return 0;
